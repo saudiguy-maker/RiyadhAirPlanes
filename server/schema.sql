@@ -38,9 +38,11 @@ CREATE TABLE IF NOT EXISTS airframe (
 );
 CREATE INDEX IF NOT EXISTS airframe_hex_idx   ON airframe (icao_hex);
 CREATE INDEX IF NOT EXISTS airframe_stage_idx ON airframe (current_stage);
--- 444 airframes across four carriers: the board almost always filters by
--- operator, so this index carries most of the read load.
-CREATE INDEX IF NOT EXISTS airframe_operator_idx ON airframe (operator, current_stage);
+-- The operator index is NOT created here. On a database built by an earlier
+-- version, `airframe` already exists without an operator column, CREATE TABLE
+-- IF NOT EXISTS skips over it, and an index on a column that does not exist
+-- fails the whole migration with 42703. It is created at the foot of this
+-- file instead, after the ALTER statements that guarantee the column.
 
 -- Append-only. Never UPDATE a row here; correcting history means inserting
 -- a superseding event, so you can always reconstruct what you believed and when.
@@ -110,3 +112,44 @@ ALTER TABLE order_line ADD COLUMN IF NOT EXISTS operator TEXT NOT NULL DEFAULT '
 ALTER TABLE airframe   ADD COLUMN IF NOT EXISTS operator TEXT NOT NULL DEFAULT 'RXI';
 ALTER TABLE candidate  ADD COLUMN IF NOT EXISTS operator TEXT;
 CREATE INDEX IF NOT EXISTS airframe_operator_idx ON airframe (operator, current_stage);
+
+-- ---------------------------------------------------------------------------
+-- Automatic identity resolution
+-- ---------------------------------------------------------------------------
+
+-- Did this candidate ever appear at a factory, paint shop or handover ramp?
+-- This single flag is what separates a new-build from an in-service aircraft
+-- that happens to share a registration series, so it is stored rather than
+-- recomputed: the factory sighting may be hours before the one that binds.
+ALTER TABLE candidate ADD COLUMN IF NOT EXISTS seen_factory BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE candidate ADD COLUMN IF NOT EXISTS last_decision TEXT;
+ALTER TABLE candidate ADD COLUMN IF NOT EXISTS last_reason   TEXT;
+
+-- Every automatic binding, with the evidence that justified it. Append-only.
+-- An automatic system that cannot show its work is indistinguishable from one
+-- that guesses, and a binding that cannot be undone is a permanent bet.
+CREATE TABLE IF NOT EXISTS identity_bind (
+  id            BIGSERIAL PRIMARY KEY,
+  airframe_id   TEXT NOT NULL REFERENCES airframe(id),
+  hex           TEXT NOT NULL,
+  registration  TEXT NOT NULL,
+  operator      TEXT NOT NULL,
+  icao_type     TEXT NOT NULL,
+  site_icao     TEXT,
+  confidence    REAL NOT NULL,
+  reason        TEXT NOT NULL,
+  overflow      BOOLEAN NOT NULL DEFAULT false,
+  bound_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  reverted_at   TIMESTAMPTZ,
+  reverted_why  TEXT
+);
+CREATE INDEX IF NOT EXISTS identity_bind_frame_idx ON identity_bind (airframe_id, bound_at DESC);
+
+-- Registration is already UNIQUE on airframe, which is the database-level
+-- guarantee that two aircraft can never claim the same identity no matter
+-- what the inference layer believes.
+
+CREATE INDEX IF NOT EXISTS airframe_operator_idx ON airframe (operator, current_stage);
+CREATE INDEX IF NOT EXISTS airframe_slot_idx
+  ON airframe (operator, icao_type, identity_source)
+  WHERE registration IS NULL;
