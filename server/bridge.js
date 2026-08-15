@@ -83,6 +83,23 @@ app.post("/api/candidates/:hex/bind", async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// What the system has decided by itself, and why. Every automatic binding is
+// listed with its evidence, so a wrong one can be spotted and reversed.
+app.get("/api/identity", async (_req, res) => {
+  const [binds, pending] = await Promise.all([
+    db.recentBinds(40),
+    db.pendingCandidates(50),
+  ]);
+  res.json({ binds, pending });
+});
+
+app.delete("/api/identity/:bindId", async (req, res) => {
+  const id = await db.revertBind(Number(req.params.bindId), req.body?.why ?? "manual revert");
+  if (!id) return res.status(404).json({ error: "no such open binding" });
+  broadcast({ type: "unbound", airframe_id: id });
+  res.json({ reverted: id });
+});
+
 app.get("/api/health", async (_req, res) => {
   try {
     await pool.query("SELECT 1");
@@ -102,13 +119,24 @@ let worker = null;
 if (process.env.INGEST !== "off") {
   worker = createWorker({ db, redisUrl: process.env.REDIS_URL });
 
+  // NOTE: the spread must come FIRST and `type` last. Written the other way
+  // round — { type: "milestone", ...m } — the payload's own `type` field (the
+  // aircraft type, "787-9") silently overwrites the message kind, and every
+  // client test for d.type === "milestone" fails forever. The aircraft type is
+  // renamed to aircraft_type so the two can never collide again.
   worker.on("milestone", async (m) => {
-    broadcast({ type: "milestone", ...m });
+    broadcast({ ...m, aircraft_type: m.type, type: "milestone" });
     console.log(`[milestone] ${m.stage} ${m.registration ?? m.hex} — ${m.why}`);
   });
   worker.on("provisional", (p) =>
     broadcast({ type: "provisional", stage: p.stage, airframe_id: p.airframe.id, why: p.why }));
-  worker.on("candidate", (c) => broadcast({ type: "candidate", ...c }));
+  worker.on("candidate", (c) => broadcast({ ...c, aircraft_type: c.type, type: "candidate" }));
+  // An aircraft the system named by itself. Pushed live so the roster count
+  // and the frame's identity update without a reload.
+  worker.on("identified", (i) => broadcast({ ...i, aircraft_type: i.type, type: "identified" }));
+  worker.on("no-slot", (n) =>
+    console.warn("[identity] no slot for", n.reg, n.operator, n.type,
+                 "— the seeded backlog for this type may be out of date"));
   worker.on("bound", (b) => broadcast({ type: "bound", hex: b.hex, airframe_id: b.airframe.id }));
   worker.on("tick", (t) => broadcast({ type: "tick", at: t.at, health: t.health }));
   worker.on("error", (e) => console.error("[ingest]", e.message));
