@@ -92,6 +92,22 @@ export function operatorOfReg(reg) {
   return null;
 }
 
+/**
+ * Delivery ferries fly under the operator's own ICAO designator with a high
+ * block number — Riyadh Air used RXI9901 for both HZ-RXAF on 3 July 2026 and
+ * HZ-RXAG on 29 July. That is emphatically not a revenue flight, and reading
+ * it as one collapses DELIVERY and SERVICE into a single event: every
+ * aircraft would "enter service" on the very flight that delivers it, and the
+ * distinction the tracker exists to draw would disappear.
+ *
+ * The 99xx block is the convention across all four carriers for ferry and
+ * positioning work. Treated as delivery, never as service.
+ */
+export const FERRY_CALLSIGN = /^[A-Z]{3}99\d{2}$/;
+
+export const isFerryCallsign = (cs) =>
+  FERRY_CALLSIGN.test((cs ?? "").trim().toUpperCase());
+
 /** Which operator does this callsign belong to? A match means the aircraft
  *  is flying commercially — it has been handed over. */
 export function operatorOfCallsign(callsign) {
