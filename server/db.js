@@ -43,6 +43,121 @@ export function createDb(pool) {
         [c.hex, c.reg, c.type, c.site, c.first_seen, c.operator ?? null]);
     },
 
+    /* ---- automatic identity resolution ---- */
+
+    /** Unclaimed placeholder rows this registration could legitimately take. */
+    async openSlots(operator, icaoType) {
+      const { rows } = await pool.query(
+        `SELECT id FROM airframe
+          WHERE operator = $1 AND icao_type = $2
+            AND registration IS NULL AND identity_source = 'projected'`,
+        [operator, icaoType]);
+      return rows;
+    },
+
+    async isRegTaken(reg) {
+      const { rows } = await pool.query(
+        `SELECT 1 FROM airframe WHERE registration = $1 LIMIT 1`, [reg]);
+      return rows.length > 0;
+    },
+
+    /**
+     * Claim a slot for a real aircraft. Written as one statement guarded on
+     * `registration IS NULL` so two workers racing the same blip cannot both
+     * win: the second UPDATE matches no rows and returns nothing.
+     */
+    async claimSlot(airframeId, { reg, hex, msn = null }) {
+      const { rows } = await pool.query(
+        `UPDATE airframe
+            SET registration = $2, icao_hex = $3, msn = COALESCE($4, msn),
+                identity_source = 'inferred', updated_at = now()
+          WHERE id = $1 AND registration IS NULL
+          RETURNING id, current_stage, type_code, icao_type, manufacturer,
+                    registration, operator`,
+        [airframeId, reg, hex, msn]);
+      return rows[0] ?? null;
+    },
+
+    /**
+     * No seeded slot exists — create the airframe from observation. Used for
+     * Saudia's 787 backlog, which is real but has no published figure and so
+     * is seeded at zero on purpose.
+     */
+    async createObservedAirframe({ operator, manufacturer, typeCode, icaoType, reg, hex }) {
+      const { rows } = await pool.query(
+        `INSERT INTO airframe
+           (id, operator, manufacturer, type_code, icao_type, registration,
+            icao_hex, identity_source, current_stage)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'observed','ORDERED')
+         ON CONFLICT (registration) DO NOTHING
+         RETURNING id, current_stage, type_code, icao_type, manufacturer,
+                   registration, operator`,
+        [`${operator}-${icaoType}-OBS-${reg}`, operator, manufacturer,
+         typeCode, icaoType, reg, hex]);
+      return rows[0] ?? null;
+    },
+
+    async recordBind(b) {
+      await pool.query(
+        `INSERT INTO identity_bind
+           (airframe_id, hex, registration, operator, icao_type, site_icao,
+            confidence, reason, overflow)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        [b.airframe_id, b.hex, b.registration, b.operator, b.icao_type,
+         b.site_icao, b.confidence, b.reason, b.overflow ?? false]);
+    },
+
+    /** Undo a binding. The airframe reverts to an empty placeholder; the
+     *  stage history it accumulated is left in place but orphaned, which is
+     *  visible and correctable, unlike silently deleting it. */
+    async revertBind(bindId, why) {
+      const { rows } = await pool.query(
+        `SELECT airframe_id FROM identity_bind WHERE id = $1 AND reverted_at IS NULL`,
+        [bindId]);
+      if (!rows[0]) return null;
+      await pool.query(
+        `UPDATE airframe SET registration = NULL, icao_hex = NULL,
+                identity_source = 'projected', updated_at = now()
+          WHERE id = $1`, [rows[0].airframe_id]);
+      await pool.query(
+        `UPDATE identity_bind SET reverted_at = now(), reverted_why = $2 WHERE id = $1`,
+        [bindId, why]);
+      return rows[0].airframe_id;
+    },
+
+    async markCandidate(hex, { decision, reason, seenFactory }) {
+      await pool.query(
+        `UPDATE candidate
+            SET last_decision = $2, last_reason = $3,
+                seen_factory = candidate.seen_factory OR $4,
+                resolved = ($2 = 'BIND')
+          WHERE hex = $1`,
+        [hex, decision, reason, !!seenFactory]);
+    },
+
+    async getCandidate(hex) {
+      const { rows } = await pool.query(
+        `SELECT * FROM candidate WHERE hex = $1`, [hex]);
+      return rows[0] ?? null;
+    },
+
+    /** Candidates worth re-testing on the nightly pass. */
+    async pendingCandidates(limit = 200) {
+      const { rows } = await pool.query(
+        `SELECT * FROM candidate
+          WHERE resolved = false AND registration IS NOT NULL
+          ORDER BY sightings DESC LIMIT $1`, [limit]);
+      return rows;
+    },
+
+    async recentBinds(limit = 40) {
+      const { rows } = await pool.query(
+        `SELECT b.*, a.type_code FROM identity_bind b
+           JOIN airframe a ON a.id = b.airframe_id
+          ORDER BY b.bound_at DESC LIMIT $1`, [limit]);
+      return rows;
+    },
+
     async insertStageEvent(e) {
       // ON CONFLICT DO NOTHING is the permanent twin of the Redis guard.
       const { rows } = await pool.query(
