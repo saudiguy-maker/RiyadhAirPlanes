@@ -145,18 +145,42 @@ export default function App() {
         if (d.type === "milestone") {
           setFeed((f) => [{
             id: `${d.airframe_id}-${d.stage}-${d.at}`, at: d.at,
-            frame: d.registration || d.hex, type: d.type, stage: d.stage, operator: d.operator,
-            mfr: d.manufacturer ?? "BOEING", site: d.site, source: "ADSB", why: d.why,
+            frame: d.registration || d.hex, type: d.aircraft_type, stage: d.stage,
+            operator: d.operator, mfr: d.manufacturer ?? "BOEING", site: d.site,
+            source: "ADSB", why: d.why,
           }, ...f].slice(0, 80));
           setRoster((r) => r.map((f) =>
             f.id === d.airframe_id ? { ...f, current_stage: d.stage } : f));
           setFlash(d.airframe_id);
           setTimeout(() => setFlash(null), 1600);
         }
-        if (d.type === "candidate") {
+
+        // The system named an aircraft by itself: a placeholder row stops
+        // being "the 12th A321neo flynas will get" and becomes HZ-NS44.
+        if (d.type === "identified") {
           setFeed((f) => [{
-            id: `cand-${d.hex}-${Date.now()}`, at: Date.now(), frame: d.hex,
-            type: d.type, stage: "UNBOUND", site: d.site, source: "ADSB", candidate: true,
+            id: `id-${d.airframe_id}-${d.at ?? Date.now()}`, at: Date.now(),
+            frame: d.registration, type: d.aircraft_type, stage: "IDENTIFIED",
+            operator: d.operator, site: d.site, source: "AUTO", why: d.why,
+            identified: true,
+          }, ...f].slice(0, 80));
+          setRoster((r) => r.map((f) =>
+            f.id === d.airframe_id
+              ? { ...f, registration: d.registration, icao_hex: d.hex,
+                  identity_source: d.overflow ? "observed" : "inferred" }
+              : f));
+          setFlash(d.airframe_id);
+          setTimeout(() => setFlash(null), 1600);
+        }
+
+        // Only aircraft still under consideration are worth showing. A REJECT
+        // is the system correctly ignoring an in-service airliner, and there
+        // are hundreds of those over Saudi Arabia every day.
+        if (d.type === "candidate" && d.decision !== "REJECT") {
+          setFeed((f) => [{
+            id: `cand-${d.hex}-${Date.now()}`, at: Date.now(),
+            frame: d.reg || d.hex, type: d.aircraft_type, stage: "UNBOUND",
+            site: d.site, source: "ADSB", candidate: true, why: d.why,
           }, ...f].slice(0, 80));
         }
       };
