@@ -1,5 +1,6 @@
 import { SITES, siteRoles } from "../config/sites.js";
 import { CALLSIGNS, FLEET_TYPES, inFlightTest } from "../config/watchlist.js";
+import { operatorOfCallsign } from "../config/operators.js";
 
 /**
  * Rules that turn flights into milestones. Each returns null or
@@ -92,12 +93,41 @@ export function inferDelivery(sortie, ctx = {}) {
   };
 }
 
-/** First revenue callsign. The airframe stops being a product. */
+/**
+ * First revenue callsign. The airframe stops being a product.
+ *
+ * Two things this deliberately does NOT do.
+ *
+ * It does not require the airframe to have reached DELIVERY first. That
+ * precondition looks like sound bookkeeping and is in fact a trap: an
+ * aircraft handed over before this system was watching sits at whatever
+ * stage it was last seen in, and a rule gated on DELIVERY can never move it,
+ * however many revenue flights it operates. The app would go on insisting a
+ * flying airliner was in flight test forever. A revenue callsign is direct
+ * evidence of service and is treated as such, whatever we previously
+ * believed. Where the DELIVERY rung is missing, it is backfilled — with an
+ * unknown date, honestly marked, rather than a guessed one.
+ *
+ * It does not test one carrier's callsign. RIYADH_AIR was correct when the
+ * roster held one airline; with four it silently prevented Saudia, flynas
+ * and flyadeal frames from ever entering service.
+ */
 export function inferInService(blip, { currentStage }) {
-  if (STAGE_INDEX[currentStage] < STAGE_INDEX.DELIVERY) return null;
   const cs = (blip.flight ?? "").trim().toUpperCase();
-  if (!CALLSIGNS.RIYADH_AIR.test(cs)) return null;
-  return { stage: "SERVICE", confidence: 0.9, why: `operating as ${cs}` };
+  const operator = operatorOfCallsign(cs);
+  if (!operator) return null;
+  if (currentStage === "SERVICE") return null;
+
+  const missedHandover = STAGE_INDEX[currentStage] < STAGE_INDEX.DELIVERY;
+  return {
+    stage: "SERVICE",
+    confidence: missedHandover ? 0.85 : 0.9,
+    backfillDelivery: missedHandover,
+    why: missedHandover
+      ? `operating as ${cs}; handover happened before this system saw it, ` +
+        `so DELIVERY is backfilled with an unknown date`
+      : `operating as ${cs}`,
+  };
 }
 
 /**
