@@ -7,8 +7,12 @@ import { operatorOfReg, operatorOfCallsign } from "./config/operators.js";
 import { Dedup } from "./lib/dedup.js";
 import { inferAll, STAGE_INDEX, siteName } from "./lib/infer.js";
 import { AirplanesLive, AdsbFi, AdsbExchange, ProviderPool } from "./lib/providers.js";
+import { assess, chooseSlot, isFactorySite } from "./lib/identity.js";
 
 const TICK_MS = Number(process.env.TICK_MS ?? 5000);
+/** Bind aircraft the order book has no slot for. On by default: Saudia's 787
+ *  backlog is real but unpublished, so refusing would blind the app to it. */
+const ALLOW_OVERFLOW = process.env.ALLOW_OVERFLOW !== "false";
 const KM_TO_NM = 0.539957;
 
 export class IngestWorker extends EventEmitter {
@@ -99,15 +103,20 @@ export class IngestWorker extends EventEmitter {
   }
 
   /**
-   * Map a hex to an airframe. Explicit bindings win. An unbound candidate is
-   * never auto-assigned to an order line — it goes to a review queue, because
-   * a wrong binding poisons the timeline for the life of the airframe.
+   * Map a hex to an airframe.
+   *
+   * Order of preference: an explicit binding, then a registration already on
+   * the roster, then automatic resolution against the evidence rules in
+   * lib/identity.js. Anything the rules will not bind stays a candidate and
+   * is re-assessed on every subsequent sighting, so evidence accumulates
+   * instead of being thrown away.
    */
   async bind(blip, place) {
     const known = KNOWN_HEX[blip.hex] ?? (await this.db.getAirframeByHex(blip.hex));
     if (known) return known;
 
-    if (blip.reg && REG_PREFIX.RIYADH_AIR.test(blip.reg)) {
+    // A registration we already hold, newly airborne under a different hex.
+    if (blip.reg) {
       const byReg = await this.db.getAirframeByReg?.(blip.reg);
       if (byReg) {
         await this.db.bindHex?.(byReg.id, blip.hex);
@@ -124,8 +133,84 @@ export class IngestWorker extends EventEmitter {
       site: place.icao,
       first_seen: blip.ts,
     });
-    this.emit("candidate", { hex: blip.hex, type: blip.t, site: place.icao });
-    return null;
+
+    return this.resolve(blip, place);
+  }
+
+  /** Decide whether a candidate has earned a place on the roster. */
+  async resolve(blip, place) {
+    const candidate = await this.db.getCandidate?.(blip.hex);
+    const seenFactory = isFactorySite(place.icao) || !!candidate?.seen_factory;
+
+    const world = {
+      regTaken: blip.reg ? await this.db.isRegTaken?.(blip.reg) : false,
+      overflowAllowed: ALLOW_OVERFLOW,
+    };
+
+    const verdict = assess({
+      blip, place, world,
+      candidate: candidate ? { ...candidate, seen_factory: seenFactory } : null,
+    });
+
+    await this.db.markCandidate?.(blip.hex, {
+      decision: verdict.decision, reason: verdict.reason, seenFactory,
+    });
+
+    if (verdict.decision !== "BIND") {
+      this.emit("candidate", {
+        hex: blip.hex, reg: blip.reg, type: blip.t, site: place.icao,
+        decision: verdict.decision, why: verdict.reason,
+      });
+      return null;
+    }
+
+    return this.claim(blip, place, verdict);
+  }
+
+  /** Attach a proven registration to a placeholder row, or create one. */
+  async claim(blip, place, verdict) {
+    const meta = FLEET_TYPES[blip.t];
+    let airframe = null;
+
+    if (!verdict.overflow) {
+      const slots = await this.db.openSlots?.(verdict.operator, blip.t);
+      const slot = chooseSlot(slots);
+      if (slot) airframe = await this.db.claimSlot?.(slot.id, { reg: blip.reg, hex: blip.hex });
+    }
+
+    if (!airframe && ALLOW_OVERFLOW) {
+      airframe = await this.db.createObservedAirframe?.({
+        operator: verdict.operator,
+        manufacturer: meta?.mfr ?? "UNKNOWN",
+        typeCode: meta?.type ?? blip.t,
+        icaoType: blip.t,
+        reg: blip.reg,
+        hex: blip.hex,
+      });
+    }
+
+    if (!airframe) {
+      // Backlog exhausted and overflow disabled. Not an error — it means the
+      // order book says this carrier has taken everything it ordered.
+      this.emit("no-slot", { reg: blip.reg, operator: verdict.operator, type: blip.t });
+      return null;
+    }
+
+    await this.db.recordBind?.({
+      airframe_id: airframe.id, hex: blip.hex, registration: blip.reg,
+      operator: verdict.operator, icao_type: blip.t, site_icao: place.icao,
+      confidence: verdict.confidence, reason: verdict.reason,
+      overflow: !!verdict.overflow,
+    });
+
+    this.emit("identified", {
+      airframe_id: airframe.id, registration: blip.reg, hex: blip.hex,
+      operator: verdict.operator, type: meta?.type ?? blip.t,
+      site: siteName(place.icao), confidence: verdict.confidence,
+      why: verdict.reason, overflow: !!verdict.overflow,
+    });
+
+    return airframe;
   }
 
   /** Run inference, then let the dedup layer decide whether it is news. */
@@ -211,13 +296,22 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const stub = {
     getAirframeByHex: async (h) => memory.get(h) ?? null,
     getAirframeByReg: async () => null,
-    createCandidate: async (c) => console.log("[candidate]", c.hex, c.type, c.site),
+    createCandidate: async (c) => { memory.set(`c:${c.hex}`, { ...(memory.get(`c:${c.hex}`) ?? { sightings: 0, first_seen: c.first_seen }), sightings: (memory.get(`c:${c.hex}`)?.sightings ?? 0) + 1 }); },
+    getCandidate: async (h) => memory.get(`c:${h}`) ?? null,
+    markCandidate: async () => {},
+    isRegTaken: async () => false,
+    openSlots: async () => [],
+    claimSlot: async () => null,
+    createObservedAirframe: async () => null,
+    recordBind: async () => {},
     insertStageEvent: async (e) => console.log("[event]", e.stage, e.airframe_id, e.raw_ref),
     setStage: async () => {},
     recordFix: async () => {},
   };
   const w = createWorker({ db: stub });
   w.on("milestone", (m) => console.log("MILESTONE", m.stage, m.registration ?? m.hex, m.why));
+  w.on("identified", (i) => console.log("IDENTIFIED", i.registration, i.operator, i.type, "—", i.why));
+  w.on("candidate", (c) => console.log("[candidate]", c.hex, c.reg ?? "no-reg", c.decision ?? "", c.why ?? ""));
   w.on("error", (e) => console.error("worker error:", e.message));
   w.start();
   console.log(`watching ${POLLED_SITES.join(" ")} every ${TICK_MS}ms`);
