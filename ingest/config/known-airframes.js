@@ -67,8 +67,23 @@ export const VERIFIED = [
       { stage: "FIRST", on: "2026-07-07", from: "KCHS", to: "KCHS" },
       { stage: "FIRST", on: "2026-07-19", from: "KCHS", to: "KCHS",
         note: "fourth flight, callsign BOE047" },
+      // ---------------------------------------------------------------
+      // Reported in service on 2026-08-15, later than any production log
+      // reachable at the time of writing — those still end at the 19 July
+      // test flight. If you can pin the handover date and route, fill in
+      // the two lines below, delete this comment, and change `stage` above
+      // to "SERVICE". Leave them commented out and the worker will still
+      // correct the record by itself the next time it sees the aircraft
+      // flying an RXI callsign; it will simply record the handover date as
+      // unknown rather than wrong.
+      //
+      // { stage: "DELIVERY", on: "2026-08-??", from: "KCHS", to: "OEJN" },
+      // { stage: "SERVICE",  on: "2026-08-??" },
+      // ---------------------------------------------------------------
     ],
-    note: "Not delivered. Do not count in delivery totals.",
+    note: "Delivery not confirmed by any public log through 2026-08-15. " +
+          "Left at FIRST rather than advanced on an unverified date — the " +
+          "worker will promote it on its own from a revenue callsign.",
   },
 ];
 
